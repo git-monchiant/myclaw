@@ -8,7 +8,7 @@ import {
   type LocationEventMessage,
   type FileEventMessage,
 } from "@line/bot-sdk";
-import { chat } from "./ai.js";
+import { chat, type ChatResult } from "./ai.js";
 import { downloadLineMedia, type MediaData } from "./media.js";
 
 const config = {
@@ -16,7 +16,7 @@ const config = {
   channelSecret: process.env.LINE_CHANNEL_SECRET!,
 };
 
-const lineClient = new messagingApi.MessagingApiClient({
+export const lineClient = new messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
@@ -223,15 +223,43 @@ export async function handleWebhook(events: WebhookEvent[]): Promise<void> {
       await lineClient.showLoadingAnimation({ chatId: userId, loadingSeconds: 60 }).catch(() => {});
 
       // ส่งข้อความไป AI แล้วรอคำตอบ (do-until loop อยู่ข้างใน)
-      const reply = await chat(userId, processed.text, processed.media);
+      const result = await chat(userId, processed.text, processed.media);
 
-      console.log(`[AI] → ${reply.substring(0, 100)}...`);
+      console.log(`[AI] → ${result.text.substring(0, 100)}...`);
 
-      // ส่งคำตอบกลับ LINE (strip markdown → แบ่งตรงจุดที่เหมาะสม)
-      const chunks = splitReply(stripMarkdown(reply));
+      // สร้าง messages สำหรับ reply
+      const messages: Array<{ type: string; text?: string; originalContentUrl?: string; previewImageUrl?: string; duration?: number }> = [];
+
+      // ถ้ามี image จาก message tool → ส่งเป็น image message
+      if (result.imageUrl) {
+        console.log(`[LINE] Sending image: ${result.imageUrl}`);
+        messages.push({
+          type: "image",
+          originalContentUrl: result.imageUrl,
+          previewImageUrl: result.imageUrl,
+        });
+      }
+
+      // ถ้ามี audio จาก TTS → ส่งเป็น audio message
+      if (result.audioUrl) {
+        console.log(`[LINE] Sending audio: ${result.audioUrl} (${result.audioDuration}ms)`);
+        messages.push({
+          type: "audio",
+          originalContentUrl: result.audioUrl,
+          duration: result.audioDuration || 5000,
+        });
+      }
+
+      // ส่งคำตอบ text กลับ LINE (strip markdown → แบ่งตรงจุดที่เหมาะสม)
+      const chunks = splitReply(stripMarkdown(result.text));
+      for (const text of chunks) {
+        messages.push({ type: "text", text });
+      }
+
+      // LINE reply (สูงสุด 5 messages)
       await lineClient.replyMessage({
         replyToken,
-        messages: chunks.map((text) => ({ type: "text" as const, text })),
+        messages: messages.slice(0, 5) as any,
       });
     } catch (err: any) {
       console.error("[ERROR]", err);

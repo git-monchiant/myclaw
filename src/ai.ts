@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { getToolDefinitions, executeTool, findTool } from "./tools/index.js";
+import { getToolDefinitions, executeTool, findTool, type ToolContext } from "./tools/index.js";
 import type { MediaData } from "./media.js";
+import { lineClient } from "./line.js";
 import {
   saveMessage,
   loadHistory,
@@ -48,12 +49,42 @@ const memoryConfig = {
   dataDir: process.env.DATA_DIR || "./data",
 };
 
+// ===== Chat result (text + optional media) =====
+export interface ChatResult {
+  text: string;
+  audioUrl?: string;
+  audioDuration?: number;
+  imageUrl?: string;
+}
+
+// Audio result จาก TTS tool (set ระหว่าง agent loop, อ่านหลัง loop จบ)
+type AudioResult = { url: string; duration: number };
+let _lastAudioResult: AudioResult | undefined;
+
+// Image result จาก message tool (set ระหว่าง agent loop)
+let _lastImageUrl: string | undefined;
+
+/** เช็ค tool result ว่ามี audioUrl หรือ imageUrl มั้ย (เรียกหลัง executeTool) */
+function checkToolResultForMedia(result: string): void {
+  try {
+    const parsed = JSON.parse(result);
+    if (parsed.audioUrl && parsed.success) {
+      _lastAudioResult = { url: parsed.audioUrl, duration: parsed.duration || 0 };
+      console.log(`[AI] Audio detected from TTS tool: ${parsed.audioUrl}`);
+    }
+    if (parsed.imageUrl && parsed.success) {
+      _lastImageUrl = parsed.imageUrl;
+      console.log(`[AI] Image detected: ${parsed.imageUrl}`);
+    }
+  } catch { /* not JSON, ignore */ }
+}
+
 /**
  * Core agent loop (do-until) + Memory System
  */
-export async function chat(userId: string, message: string, media?: MediaData): Promise<string> {
+export async function chat(userId: string, message: string, media?: MediaData): Promise<ChatResult> {
   if (AI_PROVIDER === "none") {
-    return "ยังไม่ได้ตั้งค่า AI provider กรุณาใส่ GEMINI_API_KEY, OLLAMA_MODEL หรือ ANTHROPIC_API_KEY ใน .env";
+    return { text: "ยังไม่ได้ตั้งค่า AI provider กรุณาใส่ GEMINI_API_KEY, OLLAMA_MODEL หรือ ANTHROPIC_API_KEY ใน .env" };
   }
 
   // 1. โหลด history จาก DB
@@ -84,24 +115,28 @@ export async function chat(userId: string, message: string, media?: MediaData): 
 
   let reply: string;
 
+  // เก็บ media result จาก tools (ถ้ามี)
+  _lastAudioResult = undefined;
+  _lastImageUrl = undefined;
+
   console.log(`[AI] Using: ${providerLabel[AI_PROVIDER]}`);
 
   if (AI_PROVIDER === "gemini") {
     try {
-      reply = await chatGemini(message, dbHistory, fullSystemPrompt, media);
+      reply = await chatGemini(message, dbHistory, fullSystemPrompt, userId, media);
     } catch (err: any) {
       // Auto-fallback: ถ้า Gemini error → ลองใช้ Ollama แทน (ไม่ส่ง media เพราะ text-only)
       if (process.env.OLLAMA_MODEL?.trim()) {
         console.log(`[AI] Gemini failed (${err?.message?.substring(0, 80)}), falling back to Ollama (${OLLAMA_MODEL})`);
-        reply = await chatOllama(message, dbHistory, fullSystemPrompt);
+        reply = await chatOllama(message, dbHistory, fullSystemPrompt, userId);
       } else {
         throw err;
       }
     }
   } else if (AI_PROVIDER === "ollama") {
-    reply = await chatOllama(message, dbHistory, fullSystemPrompt);
+    reply = await chatOllama(message, dbHistory, fullSystemPrompt, userId);
   } else {
-    reply = await chatAnthropic(message, dbHistory, fullSystemPrompt, media);
+    reply = await chatAnthropic(message, dbHistory, fullSystemPrompt, userId, media);
   }
 
   // ถ้ามี media → เก็บ user message พร้อม AI description/transcript (เหมือน OpenClaw)
@@ -121,8 +156,18 @@ export async function chat(userId: string, message: string, media?: MediaData): 
   // บันทึกคำตอบ AI ลง DB + index เข้า memory
   saveMessage(userId, "assistant", reply, memoryConfig).catch(console.error);
 
-  return reply;
+  const result: ChatResult = { text: reply };
+  const audio = _lastAudioResult as AudioResult | undefined;
+  if (audio) {
+    result.audioUrl = audio.url;
+    result.audioDuration = audio.duration;
+  }
+  if (_lastImageUrl) {
+    result.imageUrl = _lastImageUrl;
+  }
+  return result;
 }
+
 
 // ===== Fallback: parse tool call from text =====
 function parseToolCallFromText(
@@ -147,8 +192,10 @@ async function chatGemini(
   message: string,
   dbHistory: Array<{ role: string; content: string }>,
   systemPrompt: string,
+  userId: string,
   media?: MediaData,
 ): Promise<string> {
+  const toolCtx: ToolContext = { userId, lineClient };
   const toolDefs = getToolDefinitions();
 
   // Gemini format: role = "user" | "model"
@@ -174,7 +221,9 @@ async function chatGemini(
   contents.push({ role: "user", parts: userParts });
 
   // แปลง tools เป็น Gemini functionDeclarations
-  const geminiTools = toolDefs.length > 0
+  // ปิด tools เมื่อมี media (video/audio) — Gemini ทำ multimodal + tools พร้อมกันไม่ดี
+  const hasHeavyMedia = media && (media.mimeType.startsWith("video/") || media.mimeType.startsWith("audio/"));
+  const geminiTools = toolDefs.length > 0 && !hasHeavyMedia
     ? [{
         functionDeclarations: toolDefs.map((t) => ({
           name: t.name,
@@ -242,7 +291,8 @@ async function chatGemini(
       for (const part of functionCalls) {
         const fc = part.functionCall!;
         console.log(`[tool] ${fc.name}(${JSON.stringify(fc.args)})`);
-        const result = await executeTool(fc.name, fc.args);
+        const result = await executeTool(fc.name, fc.args, toolCtx);
+        checkToolResultForMedia(result);
         responseParts.push({
           functionResponse: {
             name: fc.name,
@@ -268,7 +318,9 @@ async function chatOllama(
   message: string,
   dbHistory: Array<{ role: string; content: string }>,
   systemPrompt: string,
+  userId: string,
 ): Promise<string> {
+  const toolCtx: ToolContext = { userId, lineClient };
   const tools = getToolDefinitions();
 
   const messages: Array<{ role: string; content: string; tool_calls?: unknown[]; tool_call_id?: string }> = [
@@ -342,7 +394,8 @@ async function chatOllama(
       for (const tc of assistantMsg.tool_calls) {
         const args = JSON.parse(tc.function.arguments);
         console.log(`[tool] ${tc.function.name}(${JSON.stringify(args)})`);
-        const result = await executeTool(tc.function.name, args);
+        const result = await executeTool(tc.function.name, args, toolCtx);
+        checkToolResultForMedia(result);
         messages.push({
           role: "tool",
           content: result,
@@ -355,7 +408,8 @@ async function chatOllama(
     const textToolCall = parseToolCallFromText(assistantMsg.content || "");
     if (textToolCall) {
       console.log(`[tool/text-fallback] ${textToolCall.name}(${JSON.stringify(textToolCall.args)})`);
-      const result = await executeTool(textToolCall.name, textToolCall.args);
+      const result = await executeTool(textToolCall.name, textToolCall.args, toolCtx);
+      checkToolResultForMedia(result);
       messages.push({
         role: "tool",
         content: result,
@@ -378,8 +432,10 @@ async function chatAnthropic(
   message: string,
   dbHistory: Array<{ role: string; content: string }>,
   systemPrompt: string,
+  userId: string,
   media?: MediaData,
 ): Promise<string> {
+  const toolCtx: ToolContext = { userId, lineClient };
   const history: Anthropic.MessageParam[] = dbHistory
     .slice(-(MAX_HISTORY - 1))
     .map((m) => ({
@@ -427,7 +483,8 @@ async function chatAnthropic(
       for (const block of assistantContent) {
         if (block.type === "tool_use") {
           console.log(`[tool] ${block.name}(${JSON.stringify(block.input)})`);
-          const result = await executeTool(block.name, block.input as Record<string, unknown>);
+          const result = await executeTool(block.name, block.input as Record<string, unknown>, toolCtx);
+          checkToolResultForMedia(result);
           toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result });
         }
       }

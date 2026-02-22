@@ -10,6 +10,13 @@
  */
 
 import type Anthropic from "@anthropic-ai/sdk";
+import type { messagingApi } from "@line/bot-sdk";
+
+// Context ที่ส่งให้ tool ทุกตัวเมื่อถูกเรียก
+export interface ToolContext {
+  userId: string;
+  lineClient?: messagingApi.MessagingApiClient;
+}
 
 // Tool definition ที่ทุก tool ต้อง implement
 export interface ToolDefinition {
@@ -23,5 +30,5 @@ export interface ToolDefinition {
   inputSchema: Anthropic.Tool["input_schema"];
 
   // function ที่รันจริงเมื่อ AI เรียก tool
-  execute: (input: Record<string, unknown>) => Promise<string>;
+  execute: (input: Record<string, unknown>, context?: ToolContext) => Promise<string>;
 }
